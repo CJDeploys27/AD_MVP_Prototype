@@ -1,0 +1,17 @@
+boto3>=1.34.0
+requests>=2.31.0
+psycopg2-binary>=2.9.9
+pydantic>=2.6.0
+python-dotenv>=1.0.1
+alembic>=1.13.0
+pystac-client>=0.7.5
+opencv-python-headless>=4.9.0
+numpy>=1.26.0
+streamlit
+pandas
+psycopg2-binary
+folium
+streamlit-folium
+pydeck
+boto3
+python-dotenv
