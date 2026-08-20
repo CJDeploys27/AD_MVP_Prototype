@@ -3,14 +3,24 @@ import psycopg2
 from contextlib import contextmanager
 from dotenv import load_dotenv
 
-# 1. LOAD ENVIRONMENT VARIABLES ONCE & SANITIZE WHITESPACE
+# Load local .env for local computer execution
 load_dotenv()
 
-DB_HOST = (os.getenv("DB_HOST") or "").strip()
-DB_NAME = (os.getenv("DB_NAME", "geospatial_metadata") or "").strip()
-DB_USER = (os.getenv("DB_USER") or "").strip()
-DB_PASSWORD = (os.getenv("DB_PASSWORD") or "").strip()
-DB_PORT = (os.getenv("DB_PORT", "5432") or "").strip()
+def get_setting(key, default=""):
+    """Fetches credentials from Streamlit Cloud Secrets first, then falls back to local .env"""
+    try:
+        import streamlit as st
+        if hasattr(st, "secrets") and key in st.secrets:
+            return str(st.secrets[key]).strip().strip('"').strip("'")
+    except Exception:
+        pass
+    return (os.getenv(key) or default).strip().strip('"').strip("'")
+
+DB_HOST = get_setting("DB_HOST")
+DB_NAME = get_setting("DB_NAME", "geospatial_metadata")
+DB_USER = get_setting("DB_USER", "cloud_admin")
+DB_PASSWORD = get_setting("DB_PASSWORD")
+DB_PORT = get_setting("DB_PORT", "5432")
 
 def get_connection():
     """
@@ -28,40 +38,31 @@ def get_connection():
         )
         return conn
     except psycopg2.OperationalError as e:
-        print(f"❌ Critical Error: Could not connect to the database. {e}")
+        print(f"❌ Critical Error: Could not connect to database at host '{DB_HOST}'. {e}")
         raise
 
 @contextmanager
 def get_db_cursor(commit=True):
     """
-    A Python Context Manager for safe database transactions.
-    It automatically handles creating cursors, committing data, 
-    rolling back on errors, and closing connections so nothing leaks.
+    Context Manager for safe database transactions.
     """
     conn = get_connection()
     cursor = conn.cursor()
     try:
-        # Yield gives the cursor to your main script to run SQL queries
         yield cursor
-        
-        # If the script finishes without crashing, save (commit) the changes
         if commit:
             conn.commit()
     except Exception as e:
-        # If ANY error occurs in your main script, undo (rollback) the database changes
         conn.rollback()
         print(f"⚠️ Transaction failed. Changes rolled back. Error: {e}")
         raise
     finally:
-        # Always close the doors when you leave, no matter what happened
         cursor.close()
         conn.close()
 
-# 3. BUILT-IN DIAGNOSTIC TEST
 if __name__ == "__main__":
     print("🔍 Testing connection to PostgreSQL/PostGIS database...")
     try:
-        # We test the context manager by asking the database for its version
         with get_db_cursor(commit=False) as test_cursor:
             test_cursor.execute("SELECT version();")
             pg_version = test_cursor.fetchone()[0]
