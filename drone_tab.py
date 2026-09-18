@@ -259,7 +259,7 @@ def render(s3_client, processed_bucket, mapbox_token=""):
         if preview in assets:
             st.image(_presign(s3_client, processed_bucket, preview),
                      caption=f"VARI crop-health map — {flight}",
-                     use_container_width=True)
+                     width="stretch")
 
     if has_pz and show_problem and pz.get("scouting_targets"):
         import pandas as pd
@@ -267,7 +267,7 @@ def render(s3_client, processed_bucket, mapbox_token=""):
         trows = [{"#": i, "Latitude": t["lat"], "Longitude": t["lon"],
                   "Low-vigor area (ac)": t["area_acres"]}
                  for i, t in enumerate(pz["scouting_targets"], 1)]
-        st.dataframe(pd.DataFrame(trows), hide_index=True, use_container_width=True)
+        st.dataframe(pd.DataFrame(trows), hide_index=True, width="stretch")
 
     if stats:
         idx = stats.get("indices", {})
@@ -283,7 +283,7 @@ def render(s3_client, processed_bucket, mapbox_token=""):
             import pandas as pd
             st.markdown("**Vegetation index distributions**")
             st.dataframe(pd.DataFrame(rows), hide_index=True,
-                         use_container_width=True)
+                         width="stretch")
     else:
         st.warning("No stats.json for this flight yet — showing available assets only.")
 
