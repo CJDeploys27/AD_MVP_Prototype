@@ -11,6 +11,7 @@ from dotenv import load_dotenv
 # Path setup to import local DB connector
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from utilities.db_connector import get_db_cursor
+from drone_tab import render as render_drone_tab
 
 # Page Setup
 st.set_page_config(page_title="AD4 Crop Health", layout="wide", page_icon="🌱")
@@ -19,6 +20,7 @@ load_dotenv(override=True)
 # Environment Variables
 AWS_REGION = os.getenv("AWS_REGION", "us-east-2").strip()
 S3_BUCKET_NAME = os.getenv("S3_BUCKET_NAME", "ad4-raw-ingestion-2026-454014151118-us-east-2-an").strip().strip('\'"')
+PROCESSED_S3_BUCKET_NAME = os.getenv("PROCESSED_S3_BUCKET_NAME", "ad4-processed-training-2026-454014151118-us-east-2-an").strip().strip('\'"')
 MAPBOX_TOKEN = os.getenv("MAPBOX_API_KEY", "")
 
 # Initialize AWS S3 Client
@@ -129,7 +131,7 @@ st.markdown("---")
 # ==========================================
 # 3. TABBED DASHBOARD INTERFACE
 # ==========================================
-tab1, tab2, tab3 = st.tabs(["🗺️ Field Map & Soil", "🌤️ Spray Windows", "🖼️ Drone Diagnostics (S3)"])
+tab1, tab2, tab3, tab4 = st.tabs(["🗺️ Field Map & Soil", "🌤️ Spray Windows", "🖼️ Drone Diagnostics (S3)", "🛰️ Drone Crop Health"])
 
 # --- TAB 1: FIELD MAP & AGRONOMICS ---
 with tab1:
@@ -217,3 +219,8 @@ with tab3:
                 st.image(presigned_url, caption=f"Pulled from AWS S3: {selected_key}", use_container_width=True)
             except Exception as e:
                 st.error("Could not fetch image. Ensure your S3 bucket name and AWS credentials are correct in the .env file.")
+
+
+# --- TAB 4: DRONE CROP HEALTH (first-party imagery, read from S3) ---
+with tab4:
+    render_drone_tab(globals().get("s3_client"), PROCESSED_S3_BUCKET_NAME, MAPBOX_TOKEN)
