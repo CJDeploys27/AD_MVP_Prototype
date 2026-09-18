@@ -27,6 +27,7 @@ MAPBOX_TOKEN = os.getenv("MAPBOX_API_KEY", "")
 try:
     s3_client = boto3.client('s3', region_name=AWS_REGION)
 except Exception as e:
+    s3_client = None  # keep defined so tabs that use it don't NameError
     st.sidebar.error("AWS S3 Connection Error. Check your .env file.")
 
 # ==========================================
@@ -54,22 +55,22 @@ def fetch_agronomic_data(farm_id):
     """Fetches soil, weather, and crop history for the specific farm."""
     data = {}
     with get_db_cursor() as cursor:
-        # Soil
-        cursor.execute(f"SELECT mapunit_name, organic_matter_pct, ph_water FROM farm_soil_properties WHERE farm_id = {farm_id}")
+        # Soil (parameterized — no string interpolation of ids into SQL)
+        cursor.execute("SELECT mapunit_name, organic_matter_pct, ph_water FROM farm_soil_properties WHERE farm_id = %s", (farm_id,))
         data['soil'] = pd.DataFrame(cursor.fetchall(), columns=['Map Unit', 'OM %', 'pH'])
-        
+
         # Crop History
-        cursor.execute(f"SELECT crop_year, crop_name FROM farm_crop_history WHERE farm_id = {farm_id} ORDER BY crop_year DESC")
+        cursor.execute("SELECT crop_year, crop_name FROM farm_crop_history WHERE farm_id = %s ORDER BY crop_year DESC", (farm_id,))
         data['crops'] = pd.DataFrame(cursor.fetchall(), columns=['Year', 'Crop'])
-        
+
         # Weather
-        cursor.execute(f"SELECT forecast_time, temperature_f, wind_speed_mph, precip_probability_pct, short_forecast FROM farm_weather_forecasts WHERE farm_id = {farm_id} ORDER BY forecast_time LIMIT 12")
+        cursor.execute("SELECT forecast_time, temperature_f, wind_speed_mph, precip_probability_pct, short_forecast FROM farm_weather_forecasts WHERE farm_id = %s ORDER BY forecast_time LIMIT 12", (farm_id,))
         data['weather'] = pd.DataFrame(cursor.fetchall(), columns=['Time', 'Temp (F)', 'Wind (mph)', 'Precip %', 'Forecast'])
     return data
 
 @st.cache_data(ttl=300)
 def load_spatial_detections(base_lat, base_lon):
-    """Fetches image records and simulates coordinates over the target farm."""
+    """Fetches third-party baseline image/annotation records (no real geolocation)."""
     query = """
         SELECT im.image_id, im.s3_key, tc.display_name as species, aa.feature_type, aa.confidence_score
         FROM imagery_metadata im
@@ -81,14 +82,10 @@ def load_spatial_detections(base_lat, base_lon):
         cursor.execute(query)
         rows = cursor.fetchall()
     
-    df = pd.DataFrame(rows, columns=["image_id", "s3_key", "species", "feature_type", "confidence"])
-    
-    # SIMULATE MVP DATA: Randomize the S3 image points inside Brad Hocking's field boundary 
-    # instead of Australia so the Mapbox visual looks authentic for a Midwest farmer.
-    np.random.seed(42)
-    df["lat"] = base_lat + np.random.uniform(-0.002, 0.002, size=len(df))
-    df["lon"] = base_lon + np.random.uniform(-0.003, 0.003, size=len(df))
-    return df
+    # NOTE: these annotation rows come from the third-party baseline dataset and
+    # carry no real field geolocation. Earlier versions fabricated coordinates
+    # with np.random; we no longer do that, so they are not plotted on the map.
+    return pd.DataFrame(rows, columns=["image_id", "s3_key", "species", "feature_type", "confidence"])
 
 @st.cache_data(ttl=300)
 def load_taxonomy_counts():
@@ -151,18 +148,18 @@ with tab1:
             line_width_min_pixels=3,
         )
         
-        # Layer 2: Weed Detection Scatterplot
-        weed_layer = pdk.Layer(
-            "ScatterplotLayer",
-            data=df_spatial,
-            get_position=["lon", "lat"],
-            get_fill_color=[235, 60, 60, 200], # Red dots
-            get_radius=10,
-            pickable=True
-        )
+        # Layer 2: only plot detections that carry REAL coordinates. The
+        # third-party baseline rows don't, so this stays empty rather than
+        # showing fabricated dots. (Real drone maps live in the Drone Crop
+        # Health tab.)
+        map_layers = [boundary_layer]
+        if {"lat", "lon"}.issubset(df_spatial.columns) and not df_spatial.empty:
+            map_layers.append(pdk.Layer(
+                "ScatterplotLayer", data=df_spatial, get_position=["lon", "lat"],
+                get_fill_color=[235, 60, 60, 200], get_radius=10, pickable=True))
 
         deck = pdk.Deck(
-            layers=[boundary_layer, weed_layer],
+            layers=map_layers,
             initial_view_state=view_state,
             map_style="mapbox://styles/mapbox/satellite-v9" if MAPBOX_TOKEN else "light",
             api_keys={"mapbox": MAPBOX_TOKEN} if MAPBOX_TOKEN else None,
