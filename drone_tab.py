@@ -18,7 +18,7 @@ from PIL import Image
 
 _INDEX_ORDER = ["vari", "gli", "ngrdi", "exg", "tgi"]
 _INDEX_LABELS = {"vari": "VARI", "gli": "GLI", "ngrdi": "NGRDI",
-                 "exg": "ExG", "tgi": "TGI"}
+                 "exg": "ExG", "tgi": "TGI", "dsm": "Elevation (DSM)"}
 _INDEX_HELP = {
     "vari": "Visible Atmospherically Resistant Index — broadband greenness.",
     "gli": "Green Leaf Index.",
@@ -89,12 +89,17 @@ def _render_map(s3_client, bucket, flight, assets, mapinfo, stats,
     clon, clat = mapinfo["center"]
     bounds = [[s, w], [n, e]]  # folium: [[lat_min, lon_min], [lat_max, lon_max]]
 
-    # Selected index overlay, falling back to VARI for pre-upgrade flights.
-    ov_key = f"{flight}/derived/{index_key}_overlay.png"
+    # Selected layer overlay (DSM is a special key), falling back to VARI.
+    if index_key == "dsm":
+        ov_key = f"{flight}/derived/dsm_overlay.png"
+    else:
+        ov_key = f"{flight}/derived/{index_key}_overlay.png"
     if ov_key not in assets:
         ov_key = f"{flight}/derived/vari_overlay.png"
         index_key = "vari"
     overlay_uri = _overlay_data_uri(s3_client, bucket, ov_key)
+    layer_name = ("Elevation (DSM)" if index_key == "dsm"
+                  else f"{_INDEX_LABELS.get(index_key, index_key.upper())} crop health")
 
     m = folium.Map(location=[clat, clon], zoom_start=17, tiles=None,
                    control_scale=True)
@@ -103,8 +108,7 @@ def _render_map(s3_client, bucket, flight, assets, mapinfo, stats,
               "World_Imagery/MapServer/tile/{z}/{y}/{x}",
         attr="Esri World Imagery", name="Satellite").add_to(m)
     folium.raster_layers.ImageOverlay(
-        image=overlay_uri, bounds=bounds, opacity=0.8,
-        name=f"{_INDEX_LABELS.get(index_key, index_key.upper())} crop health"
+        image=overlay_uri, bounds=bounds, opacity=0.8, name=layer_name
     ).add_to(m)
     folium.Rectangle(bounds=bounds, color="#ffffff", weight=2, fill=False).add_to(m)
 
@@ -132,9 +136,14 @@ def _render_map(s3_client, bucket, flight, assets, mapinfo, stats,
     st_folium(m, height=520, use_container_width=True, returned_objects=[],
               key=f"map_{flight}_{index_key}_{int(show_problem)}")
 
-    lbl = _INDEX_LABELS.get(index_key, index_key.upper())
-    cap = f"{lbl} overlay (red = low, green = high) on a satellite basemap at the " \
-          "flight's real footprint."
+    if index_key == "dsm":
+        cap = ("Elevation / surface height (terrain ramp: low → high) on a "
+               "satellite basemap at the flight's real footprint. Surface height, "
+               "not true canopy height.")
+    else:
+        lbl = _INDEX_LABELS.get(index_key, index_key.upper())
+        cap = (f"{lbl} overlay (red = low, green = high) on a satellite basemap at "
+               "the flight's real footprint.")
     if targets:
         cap += f" Pink = lowest-vigor zones; {len(targets)} scouting target(s) pinned."
     st.caption(cap)
@@ -166,43 +175,56 @@ def render(s3_client, processed_bucket, mapbox_token=""):
 
     pz = (stats or {}).get("problem_zones") or {}
     has_pz = bool(pz.get("available"))
+    elev = (stats or {}).get("elevation") or {}
+    has_elev = bool(elev.get("available"))
 
     if stats:
         cc = stats.get("canopy_cover", {})
         otsu = cc.get("exg_otsu", {}).get("canopy_cover_pct")
         vari = stats.get("indices", {}).get("vari", {})
-        ncols = 5 if has_pz else 4
-        cols = st.columns(ncols)
-        cols[0].metric("Coverage", f"{stats.get('coverage_pct', '?')}%")
-        cols[1].metric("Canopy cover", f"{otsu}%" if otsu is not None else "N/A")
-        cols[2].metric("Mean VARI", f"{vari.get('mean'):.3f}" if vari else "N/A")
-        cols[3].metric("GSD", f"{stats.get('gsd_m', '?')} m")
+        metrics = [
+            ("Coverage", f"{stats.get('coverage_pct', '?')}%", None),
+            ("Canopy cover", f"{otsu}%" if otsu is not None else "N/A", None),
+            ("Mean VARI", f"{vari.get('mean'):.3f}" if vari else "N/A", None),
+            ("GSD", f"{stats.get('gsd_m', '?')} m", None),
+        ]
         if has_pz:
             pct = pz.get("flagged_pct_of_field")
             acres = pz.get("flagged_area_acres")
-            cols[4].metric(
-                "Problem area",
-                f"{pct}%" if pct is not None else "N/A",
-                help=f"Lowest-vigor ~{pz.get('percentile', 10)}% of the field "
-                     f"(~{acres} ac). Scouting targets pinned on the map.")
+            metrics.append((
+                "Problem area", f"{pct}%" if pct is not None else "N/A",
+                f"Lowest-vigor ~{pz.get('percentile', 10)}% of the field "
+                f"(~{acres} ac). Scouting targets pinned on the map."))
+        if has_elev:
+            relief = elev.get("relief_p5_p95_m", elev.get("relief_m"))
+            metrics.append((
+                "Relief", f"{relief} m" if relief is not None else "N/A",
+                "Surface-elevation range across the field (p5-p95), from the DSM. "
+                "Surface height, not true canopy height."))
+        cols = st.columns(len(metrics))
+        for col, (lbl, val, hlp) in zip(cols, metrics):
+            col.metric(lbl, val, help=hlp)
         st.caption(f"Processed {stats.get('generated_at', '?')} · "
                    f"{stats.get('sensor_note', '')}")
 
-    # Layer controls: index switcher (if >1 overlay) + problem-zone toggle.
+    # Layer controls: layer switcher (indices + elevation) + problem-zone toggle.
     avail = [i for i in _INDEX_ORDER
              if mapinfo and i in (mapinfo.get("indices") or [])]
     if not avail:
         avail = ["vari"]
+    layers = list(avail)
+    if has_elev and mapinfo and mapinfo.get("has_elevation"):
+        layers.append("dsm")
     index_key = "vari"
     show_problem = has_pz
-    if len(avail) > 1 or has_pz:
+    if len(layers) > 1 or has_pz:
         c_idx, c_pz = st.columns([2, 1])
-        if len(avail) > 1:
+        if len(layers) > 1:
             index_key = c_idx.selectbox(
-                "Index layer", avail,
+                "Map layer", layers,
                 format_func=lambda k: _INDEX_LABELS.get(k, k.upper()),
                 help="\n".join(f"{_INDEX_LABELS[k]}: {_INDEX_HELP[k]}"
-                               for k in avail if k in _INDEX_HELP))
+                               for k in layers if k in _INDEX_HELP))
         if has_pz:
             show_problem = c_pz.checkbox("Show problem zones", value=True,
                                          help="Highlight the lowest-vigor areas "
