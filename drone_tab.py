@@ -2,8 +2,10 @@
 
 Self-contained and additive: renders a new tab in dashboard.py without touching
 the existing PostGIS-backed tabs. Reads the AD4 processed bucket directly
-(orthophoto + derived VARI/index layers + stats.json + a web map overlay written
-by the drone pipeline), so it needs no database and no schema changes.
+(orthophoto + derived index overlays + problem-zone overlay + stats.json + a web
+map overlay written by the drone pipeline), so it needs no database and no
+schema changes. Works with older flights too: if a flight predates the per-index
+overlays / problem zones, it falls back to the VARI-only view.
 """
 import base64
 import io
@@ -15,6 +17,15 @@ from streamlit_folium import st_folium
 from PIL import Image
 
 _INDEX_ORDER = ["vari", "gli", "ngrdi", "exg", "tgi"]
+_INDEX_LABELS = {"vari": "VARI", "gli": "GLI", "ngrdi": "NGRDI",
+                 "exg": "ExG", "tgi": "TGI"}
+_INDEX_HELP = {
+    "vari": "Visible Atmospherically Resistant Index — broadband greenness.",
+    "gli": "Green Leaf Index.",
+    "ngrdi": "Normalized Green-Red Difference Index.",
+    "exg": "Excess Green — vegetation vs. soil segmentation.",
+    "tgi": "Triangular Greenness Index — chlorophyll proxy.",
+}
 
 
 def _list_flights(s3_client, bucket):
@@ -50,40 +61,78 @@ def _presign(s3_client, bucket, key, expires=3600):
         "get_object", Params={"Bucket": bucket, "Key": key}, ExpiresIn=expires)
 
 
-def _render_map(s3_client, bucket, flight, assets, mapinfo, mapbox_token):
-    """Interactive map: VARI raster overlaid on satellite at the field's real
-    coordinates, with the flight footprint outlined."""
+def _overlay_data_uri(s3_client, bucket, key, max_px=1000):
+    """Fetch a PNG overlay server-side, downsize, and inline as a data URI.
+
+    A presigned S3 URL can resolve to the global endpoint and 503 (wrong region);
+    fetching server-side and inlining a downsized PNG sidesteps the browser->S3
+    request (and CORS) entirely, so overlays always render.
+    """
+    obj = s3_client.get_object(Bucket=bucket, Key=key)
+    img = Image.open(io.BytesIO(obj["Body"].read())).convert("RGBA")
+    img.thumbnail((max_px, max_px))
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
+
+
+def _render_map(s3_client, bucket, flight, assets, mapinfo, stats,
+                index_key, show_problem):
+    """Interactive map: the selected index raster overlaid on satellite at the
+    field's real coordinates, optionally with problem zones + scouting markers."""
     w, s, e, n = mapinfo["lonlat_bounds"]
     clon, clat = mapinfo["center"]
     bounds = [[s, w], [n, e]]  # folium: [[lat_min, lon_min], [lat_max, lon_max]]
 
-    # Embed the overlay as a data URI instead of linking to S3 from the browser.
-    # A presigned S3 URL can resolve to the global endpoint and 503 (wrong region);
-    # fetching server-side and inlining a downsized PNG sidesteps the browser->S3
-    # request (and CORS) entirely, so the overlay always renders.
-    obj = s3_client.get_object(Bucket=bucket, Key=f"{flight}/derived/vari_overlay.png")
-    img = Image.open(io.BytesIO(obj["Body"].read())).convert("RGBA")
-    img.thumbnail((1000, 1000))
-    buf = io.BytesIO()
-    img.save(buf, format="PNG")
-    overlay_uri = "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
+    # Selected index overlay, falling back to VARI for pre-upgrade flights.
+    ov_key = f"{flight}/derived/{index_key}_overlay.png"
+    if ov_key not in assets:
+        ov_key = f"{flight}/derived/vari_overlay.png"
+        index_key = "vari"
+    overlay_uri = _overlay_data_uri(s3_client, bucket, ov_key)
 
-    m = folium.Map(location=[clat, clon], zoom_start=17, tiles=None, control_scale=True)
+    m = folium.Map(location=[clat, clon], zoom_start=17, tiles=None,
+                   control_scale=True)
     folium.TileLayer(
         tiles="https://server.arcgisonline.com/ArcGIS/rest/services/"
               "World_Imagery/MapServer/tile/{z}/{y}/{x}",
         attr="Esri World Imagery", name="Satellite").add_to(m)
     folium.raster_layers.ImageOverlay(
-        image=overlay_uri, bounds=bounds, opacity=0.8, name="VARI crop health").add_to(m)
+        image=overlay_uri, bounds=bounds, opacity=0.8,
+        name=f"{_INDEX_LABELS.get(index_key, index_key.upper())} crop health"
+    ).add_to(m)
     folium.Rectangle(bounds=bounds, color="#ffffff", weight=2, fill=False).add_to(m)
+
+    pz = (stats or {}).get("problem_zones") or {}
+    pkey = f"{flight}/derived/problem_zones_overlay.png"
+    targets = pz.get("scouting_targets", []) if show_problem else []
+    if show_problem and pz.get("available") and pkey in assets:
+        folium.raster_layers.ImageOverlay(
+            image=_overlay_data_uri(s3_client, bucket, pkey), bounds=bounds,
+            opacity=0.85, name="Problem zones").add_to(m)
+        fg = folium.FeatureGroup(name="Scouting targets").add_to(m)
+        for i, t in enumerate(targets, 1):
+            folium.Marker(
+                [t["lat"], t["lon"]],
+                tooltip=f"Scouting target {i}",
+                popup=f"Target {i} — {t['area_acres']} ac of low vigor",
+                icon=folium.Icon(color="red", icon="exclamation-sign"),
+            ).add_to(fg)
+
+    folium.LayerControl(collapsed=True).add_to(m)
     # Frame the field explicitly. fit_bounds overrides location/zoom_start and,
-    # with a per-flight component key, stops st_folium from retaining a stale
+    # with a per-view component key, stops st_folium from retaining a stale
     # pan/zoom across reruns (which otherwise leaves the field just off-screen).
     m.fit_bounds(bounds, padding=(30, 30))
-    st_folium(m, height=520, use_container_width=True,
-              returned_objects=[], key=f"map_{flight}")
-    st.caption("VARI overlay (red = low vigor, green = vegetation) on a satellite "
-               "basemap at the flight's real footprint.")
+    st_folium(m, height=520, use_container_width=True, returned_objects=[],
+              key=f"map_{flight}_{index_key}_{int(show_problem)}")
+
+    lbl = _INDEX_LABELS.get(index_key, index_key.upper())
+    cap = f"{lbl} overlay (red = low, green = high) on a satellite basemap at the " \
+          "flight's real footprint."
+    if targets:
+        cap += f" Pink = lowest-vigor zones; {len(targets)} scouting target(s) pinned."
+    st.caption(cap)
 
 
 def render(s3_client, processed_bucket, mapbox_token=""):
@@ -110,27 +159,68 @@ def render(s3_client, processed_bucket, mapbox_token=""):
     st.caption(f"First-party drone imagery, read live from `s3://{processed_bucket}/` "
                "— no database required.")
 
+    pz = (stats or {}).get("problem_zones") or {}
+    has_pz = bool(pz.get("available"))
+
     if stats:
         cc = stats.get("canopy_cover", {})
         otsu = cc.get("exg_otsu", {}).get("canopy_cover_pct")
         vari = stats.get("indices", {}).get("vari", {})
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Coverage", f"{stats.get('coverage_pct', '?')}%")
-        c2.metric("Canopy cover", f"{otsu}%" if otsu is not None else "N/A")
-        c3.metric("Mean VARI", f"{vari.get('mean'):.3f}" if vari else "N/A")
-        c4.metric("GSD", f"{stats.get('gsd_m', '?')} m")
+        ncols = 5 if has_pz else 4
+        cols = st.columns(ncols)
+        cols[0].metric("Coverage", f"{stats.get('coverage_pct', '?')}%")
+        cols[1].metric("Canopy cover", f"{otsu}%" if otsu is not None else "N/A")
+        cols[2].metric("Mean VARI", f"{vari.get('mean'):.3f}" if vari else "N/A")
+        cols[3].metric("GSD", f"{stats.get('gsd_m', '?')} m")
+        if has_pz:
+            pct = pz.get("flagged_pct_of_field")
+            acres = pz.get("flagged_area_acres")
+            cols[4].metric(
+                "Problem area",
+                f"{pct}%" if pct is not None else "N/A",
+                help=f"Lowest-vigor ~{pz.get('percentile', 10)}% of the field "
+                     f"(~{acres} ac). Scouting targets pinned on the map.")
         st.caption(f"Processed {stats.get('generated_at', '?')} · "
                    f"{stats.get('sensor_note', '')}")
 
+    # Layer controls: index switcher (if >1 overlay) + problem-zone toggle.
+    avail = [i for i in _INDEX_ORDER
+             if mapinfo and i in (mapinfo.get("indices") or [])]
+    if not avail:
+        avail = ["vari"]
+    index_key = "vari"
+    show_problem = has_pz
+    if len(avail) > 1 or has_pz:
+        c_idx, c_pz = st.columns([2, 1])
+        if len(avail) > 1:
+            index_key = c_idx.selectbox(
+                "Index layer", avail,
+                format_func=lambda k: _INDEX_LABELS.get(k, k.upper()),
+                help="\n".join(f"{_INDEX_LABELS[k]}: {_INDEX_HELP[k]}"
+                               for k in avail if k in _INDEX_HELP))
+        if has_pz:
+            show_problem = c_pz.checkbox("Show problem zones", value=True,
+                                         help="Highlight the lowest-vigor areas "
+                                              "and pin scouting targets.")
+
     # Interactive map of the flight, if the pipeline produced the overlay.
     if mapinfo and f"{flight}/derived/vari_overlay.png" in assets:
-        _render_map(s3_client, processed_bucket, flight, assets, mapinfo, mapbox_token)
+        _render_map(s3_client, processed_bucket, flight, assets, mapinfo, stats,
+                    index_key, show_problem)
     else:
         preview = f"{flight}/derived/vari_preview.png"
         if preview in assets:
             st.image(_presign(s3_client, processed_bucket, preview),
                      caption=f"VARI crop-health map — {flight}",
                      use_container_width=True)
+
+    if has_pz and show_problem and pz.get("scouting_targets"):
+        import pandas as pd
+        st.markdown("**Scouting targets** (lowest-vigor clusters, largest first)")
+        trows = [{"#": i, "Latitude": t["lat"], "Longitude": t["lon"],
+                  "Low-vigor area (ac)": t["area_acres"]}
+                 for i, t in enumerate(pz["scouting_targets"], 1)]
+        st.dataframe(pd.DataFrame(trows), hide_index=True, use_container_width=True)
 
     if stats:
         idx = stats.get("indices", {})
