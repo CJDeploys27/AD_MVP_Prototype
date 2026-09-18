@@ -48,8 +48,18 @@ def _list_flights(_s3_client, bucket):
 
 @st.cache_data(ttl=300, show_spinner=False)
 def _list_assets(_s3_client, bucket, flight):
-    resp = _s3_client.list_objects_v2(Bucket=bucket, Prefix=f"{flight}/")
-    return {o["Key"] for o in resp.get("Contents", [])}
+    keys, token = set(), None
+    while True:
+        kw = {"Bucket": bucket, "Prefix": f"{flight}/"}
+        if token:
+            kw["ContinuationToken"] = token
+        resp = _s3_client.list_objects_v2(**kw)
+        keys |= {o["Key"] for o in resp.get("Contents", [])}
+        if resp.get("IsTruncated"):
+            token = resp.get("NextContinuationToken")
+        else:
+            break
+    return keys
 
 
 @st.cache_data(ttl=300, show_spinner=False)
@@ -73,12 +83,15 @@ def _overlay_data_uri(_s3_client, bucket, key, max_px=1000):
     fetching server-side and inlining a downsized PNG sidesteps the browser->S3
     request (and CORS) entirely, so overlays always render.
     """
-    obj = _s3_client.get_object(Bucket=bucket, Key=key)
-    img = Image.open(io.BytesIO(obj["Body"].read())).convert("RGBA")
-    img.thumbnail((max_px, max_px))
-    buf = io.BytesIO()
-    img.save(buf, format="PNG")
-    return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
+    try:
+        obj = _s3_client.get_object(Bucket=bucket, Key=key)
+        img = Image.open(io.BytesIO(obj["Body"].read())).convert("RGBA")
+        img.thumbnail((max_px, max_px))
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
+    except Exception:  # noqa: BLE001 - a bad/missing overlay must not crash the tab
+        return None
 
 
 def _render_map(s3_client, bucket, flight, assets, mapinfo, stats,
@@ -107,18 +120,21 @@ def _render_map(s3_client, bucket, flight, assets, mapinfo, stats,
         tiles="https://server.arcgisonline.com/ArcGIS/rest/services/"
               "World_Imagery/MapServer/tile/{z}/{y}/{x}",
         attr="Esri World Imagery", name="Satellite").add_to(m)
-    folium.raster_layers.ImageOverlay(
-        image=overlay_uri, bounds=bounds, opacity=0.8, name=layer_name
-    ).add_to(m)
+    if overlay_uri:
+        folium.raster_layers.ImageOverlay(
+            image=overlay_uri, bounds=bounds, opacity=0.8, name=layer_name
+        ).add_to(m)
     folium.Rectangle(bounds=bounds, color="#ffffff", weight=2, fill=False).add_to(m)
 
     pz = (stats or {}).get("problem_zones") or {}
     pkey = f"{flight}/derived/problem_zones_overlay.png"
     targets = pz.get("scouting_targets", []) if show_problem else []
     if show_problem and pz.get("available") and pkey in assets:
-        folium.raster_layers.ImageOverlay(
-            image=_overlay_data_uri(s3_client, bucket, pkey), bounds=bounds,
-            opacity=0.85, name="Problem zones").add_to(m)
+        puri = _overlay_data_uri(s3_client, bucket, pkey)
+        if puri:
+            folium.raster_layers.ImageOverlay(
+                image=puri, bounds=bounds,
+                opacity=0.85, name="Problem zones").add_to(m)
         fg = folium.FeatureGroup(name="Scouting targets").add_to(m)
         for i, t in enumerate(targets, 1):
             folium.Marker(
@@ -185,7 +201,9 @@ def render(s3_client, processed_bucket, mapbox_token=""):
         metrics = [
             ("Coverage", f"{stats.get('coverage_pct', '?')}%", None),
             ("Canopy cover", f"{otsu}%" if otsu is not None else "N/A", None),
-            ("Mean VARI", f"{vari.get('mean'):.3f}" if vari else "N/A", None),
+            ("Mean VARI",
+             f"{vari['mean']:.3f}" if isinstance(vari.get('mean'), (int, float))
+             else "N/A", None),
             ("GSD", f"{stats.get('gsd_m', '?')} m", None),
         ]
         if has_pz:
@@ -230,8 +248,10 @@ def render(s3_client, processed_bucket, mapbox_token=""):
                                          help="Highlight the lowest-vigor areas "
                                               "and pin scouting targets.")
 
-    # Interactive map of the flight, if the pipeline produced the overlay.
-    if mapinfo and f"{flight}/derived/vari_overlay.png" in assets:
+    # Interactive map of the flight, if the pipeline produced the overlay
+    # and map.json carries the geo keys the map needs.
+    if (mapinfo and mapinfo.get("lonlat_bounds") and mapinfo.get("center")
+            and f"{flight}/derived/vari_overlay.png" in assets):
         _render_map(s3_client, processed_bucket, flight, assets, mapinfo, stats,
                     index_key, show_problem)
     else:
@@ -254,7 +274,8 @@ def render(s3_client, processed_bucket, mapbox_token=""):
         rows = []
         for k in _INDEX_ORDER:
             v = idx.get(k)
-            if v:
+            if v and all(isinstance(v.get(x), (int, float))
+                         for x in ("mean", "median", "p5", "p95")):
                 rows.append({"Index": k.upper(), "mean": round(v["mean"], 3),
                              "median": round(v["median"], 3),
                              "p5": round(v["p5"], 3), "p95": round(v["p95"], 3)})
