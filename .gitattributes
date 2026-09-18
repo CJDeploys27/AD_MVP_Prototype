@@ -1,0 +1,12 @@
+# Normalize line endings so Windows/Mac/Linux checkouts stop showing whole files
+# as "modified" over CRLF vs LF. Text is stored LF in the repo.
+* text=auto eol=lf
+
+# Treat binaries as binary (never line-ending-normalized or diffed as text).
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.tif binary
+*.tiff binary
+*.pdf binary
+*.parquet binary

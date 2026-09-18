@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Environment / secrets (never commit credentials)
+.env
+.env.*
+*.env
+.streamlit/secrets.toml
+
+# Pipeline scratch (in case scripts are ever run inside the repo tree)
+_work/
+_export_work/
+_derive_work/
+_selftest/
+_to_delete/
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db
