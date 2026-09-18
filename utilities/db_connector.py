@@ -38,7 +38,7 @@ def get_connection():
         )
         return conn
     except psycopg2.OperationalError as e:
-        print(f"❌ Critical Error: Could not connect to database at host '{DB_HOST}'. {e}")
+        print(f"⚠️ Database unavailable (optional) at host '{DB_HOST}'; dashboard will continue without it. {e}")
         raise
 
 @contextmanager
