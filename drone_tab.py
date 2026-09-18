@@ -28,14 +28,16 @@ _INDEX_HELP = {
 }
 
 
-def _list_flights(s3_client, bucket):
-    """Flight folders = common prefixes at the bucket root."""
+@st.cache_data(ttl=300, show_spinner=False)
+def _list_flights(_s3_client, bucket):
+    """Flight folders = common prefixes at the bucket root. Cached (5 min TTL)
+    so new flights still appear within a few minutes."""
     flights, token = [], None
     while True:
         kw = {"Bucket": bucket, "Delimiter": "/"}
         if token:
             kw["ContinuationToken"] = token
-        resp = s3_client.list_objects_v2(**kw)
+        resp = _s3_client.list_objects_v2(**kw)
         flights += [p["Prefix"].rstrip("/") for p in resp.get("CommonPrefixes", [])]
         if resp.get("IsTruncated"):
             token = resp.get("NextContinuationToken")
@@ -44,15 +46,17 @@ def _list_flights(s3_client, bucket):
     return sorted(flights)
 
 
-def _list_assets(s3_client, bucket, flight):
-    resp = s3_client.list_objects_v2(Bucket=bucket, Prefix=f"{flight}/")
+@st.cache_data(ttl=300, show_spinner=False)
+def _list_assets(_s3_client, bucket, flight):
+    resp = _s3_client.list_objects_v2(Bucket=bucket, Prefix=f"{flight}/")
     return {o["Key"] for o in resp.get("Contents", [])}
 
 
-def _load_json(s3_client, bucket, key, assets):
-    if key not in assets:
+@st.cache_data(ttl=300, show_spinner=False)
+def _load_json(_s3_client, bucket, key, _assets):
+    if key not in _assets:
         return None
-    obj = s3_client.get_object(Bucket=bucket, Key=key)
+    obj = _s3_client.get_object(Bucket=bucket, Key=key)
     return json.loads(obj["Body"].read())
 
 
@@ -61,14 +65,15 @@ def _presign(s3_client, bucket, key, expires=3600):
         "get_object", Params={"Bucket": bucket, "Key": key}, ExpiresIn=expires)
 
 
-def _overlay_data_uri(s3_client, bucket, key, max_px=1000):
+@st.cache_data(ttl=3600, show_spinner=False)
+def _overlay_data_uri(_s3_client, bucket, key, max_px=1000):
     """Fetch a PNG overlay server-side, downsize, and inline as a data URI.
 
     A presigned S3 URL can resolve to the global endpoint and 503 (wrong region);
     fetching server-side and inlining a downsized PNG sidesteps the browser->S3
     request (and CORS) entirely, so overlays always render.
     """
-    obj = s3_client.get_object(Bucket=bucket, Key=key)
+    obj = _s3_client.get_object(Bucket=bucket, Key=key)
     img = Image.open(io.BytesIO(obj["Body"].read())).convert("RGBA")
     img.thumbnail((max_px, max_px))
     buf = io.BytesIO()
