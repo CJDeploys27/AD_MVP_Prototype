@@ -5,10 +5,14 @@ the existing PostGIS-backed tabs. Reads the AD4 processed bucket directly
 (orthophoto + derived VARI/index layers + stats.json + a web map overlay written
 by the drone pipeline), so it needs no database and no schema changes.
 """
+import base64
+import io
 import json
 
 import streamlit as st
-import pydeck as pdk
+import folium
+from streamlit_folium import st_folium
+from PIL import Image
 
 _INDEX_ORDER = ["vari", "gli", "ngrdi", "exg", "tgi"]
 
@@ -51,23 +55,35 @@ def _render_map(s3_client, bucket, flight, assets, mapinfo, mapbox_token):
     coordinates, with the flight footprint outlined."""
     w, s, e, n = mapinfo["lonlat_bounds"]
     clon, clat = mapinfo["center"]
-    overlay_url = _presign(s3_client, bucket, f"{flight}/derived/vari_overlay.png")
+    bounds = [[s, w], [n, e]]  # folium: [[lat_min, lon_min], [lat_max, lon_max]]
 
-    layers = [pdk.Layer("BitmapLayer", data=None, image=overlay_url,
-                        bounds=[w, s, e, n], opacity=0.8)]
-    outline = {"type": "Feature", "geometry": {"type": "Polygon",
-               "coordinates": [[[w, s], [e, s], [e, n], [w, n], [w, s]]]}}
-    layers.append(pdk.Layer("GeoJsonLayer", data=outline, stroked=True,
-                            filled=False, get_line_color=[255, 255, 255],
-                            line_width_min_pixels=2))
-    view = pdk.ViewState(latitude=clat, longitude=clon, zoom=16, pitch=0)
-    style = "mapbox://styles/mapbox/satellite-v9" if mapbox_token else None
-    st.pydeck_chart(pdk.Deck(
-        layers=layers, initial_view_state=view, map_style=style,
-        api_keys={"mapbox": mapbox_token} if mapbox_token else None,
-    ))
-    st.caption("VARI overlay (red = low vigor, green = vegetation) on the real "
-               "flight footprint. Add a Mapbox token for a satellite basemap.")
+    # Embed the overlay as a data URI instead of linking to S3 from the browser.
+    # A presigned S3 URL can resolve to the global endpoint and 503 (wrong region);
+    # fetching server-side and inlining a downsized PNG sidesteps the browser->S3
+    # request (and CORS) entirely, so the overlay always renders.
+    obj = s3_client.get_object(Bucket=bucket, Key=f"{flight}/derived/vari_overlay.png")
+    img = Image.open(io.BytesIO(obj["Body"].read())).convert("RGBA")
+    img.thumbnail((1000, 1000))
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    overlay_uri = "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
+
+    m = folium.Map(location=[clat, clon], zoom_start=17, tiles=None, control_scale=True)
+    folium.TileLayer(
+        tiles="https://server.arcgisonline.com/ArcGIS/rest/services/"
+              "World_Imagery/MapServer/tile/{z}/{y}/{x}",
+        attr="Esri World Imagery", name="Satellite").add_to(m)
+    folium.raster_layers.ImageOverlay(
+        image=overlay_uri, bounds=bounds, opacity=0.8, name="VARI crop health").add_to(m)
+    folium.Rectangle(bounds=bounds, color="#ffffff", weight=2, fill=False).add_to(m)
+    # Frame the field explicitly. fit_bounds overrides location/zoom_start and,
+    # with a per-flight component key, stops st_folium from retaining a stale
+    # pan/zoom across reruns (which otherwise leaves the field just off-screen).
+    m.fit_bounds(bounds, padding=(30, 30))
+    st_folium(m, height=520, use_container_width=True,
+              returned_objects=[], key=f"map_{flight}")
+    st.caption("VARI overlay (red = low vigor, green = vegetation) on a satellite "
+               "basemap at the flight's real footprint.")
 
 
 def render(s3_client, processed_bucket, mapbox_token=""):
