@@ -68,156 +68,84 @@ def fetch_agronomic_data(farm_id):
         data['weather'] = pd.DataFrame(cursor.fetchall(), columns=['Time', 'Temp (F)', 'Wind (mph)', 'Precip %', 'Forecast'])
     return data
 
-@st.cache_data(ttl=300)
-def load_spatial_detections(base_lat, base_lon):
-    """Fetches third-party baseline image/annotation records (no real geolocation)."""
-    query = """
-        SELECT im.image_id, im.s3_key, tc.display_name as species, aa.feature_type, aa.confidence_score
-        FROM imagery_metadata im
-        JOIN agricultural_annotations aa ON im.image_id = aa.image_id
-        JOIN taxonomy_catalog tc ON aa.taxonomy_id = tc.taxonomy_id
-        LIMIT 100;
-    """
-    with get_db_cursor() as cursor:
-        cursor.execute(query)
-        rows = cursor.fetchall()
-    
-    # NOTE: these annotation rows come from the third-party baseline dataset and
-    # carry no real field geolocation. Earlier versions fabricated coordinates
-    # with np.random; we no longer do that, so they are not plotted on the map.
-    return pd.DataFrame(rows, columns=["image_id", "s3_key", "species", "feature_type", "confidence"])
-
-@st.cache_data(ttl=300)
-def load_taxonomy_counts():
-    """Queries PostGIS for class detection counts."""
-    query = """
-        SELECT tc.display_name, COUNT(aa.annotation_id) as total_detections
-        FROM agricultural_annotations aa
-        JOIN taxonomy_catalog tc ON aa.taxonomy_id = tc.taxonomy_id
-        GROUP BY tc.display_name ORDER BY total_detections DESC;
-    """
-    with get_db_cursor() as cursor:
-        cursor.execute(query)
-        rows = cursor.fetchall()
-    return pd.DataFrame(rows, columns=["Weed Species", "Detection Count"])
+# (Removed the DeepWeeds baseline loaders — the app no longer uses the abandoned
+#  third-party weed dataset; first-party drone data is served by drone_tab.py.)
 
 # ==========================================
-# 2. LOAD DATA & SETUP UI
+# 2. LOAD DATA (resilient)
 # ==========================================
-farm = fetch_farm_data()
-if not farm:
-    st.error("No active farm found in the database. Run your extraction scripts first.")
-    st.stop()
+# The Drone Crop Health tab reads first-party maps straight from S3, so a
+# missing or unreachable PostGIS database must NOT stop the whole app — it just
+# limits the agronomic tabs.
+farm, agro_data, db_error = None, None, None
+try:
+    farm = fetch_farm_data()
+    if farm:
+        agro_data = fetch_agronomic_data(farm['farm_id'])
+except Exception as e:
+    db_error = str(e)
 
-agro_data = fetch_agronomic_data(farm['farm_id'])
-df_spatial = load_spatial_detections(farm['lat'], farm['lon'])
-df_summary = load_taxonomy_counts()
+st.title(f"🌱 {farm['customer_name'] if farm else 'AD4'} — Crop Health & Farm Intelligence")
+st.markdown("First-party drone crop-health maps, USDA agronomic data, and AWS S3 imagery.")
 
-# Header & KPIs
-st.title(f"🌱 {farm['customer_name']} - Crop Health & Farm Intelligence")
-st.markdown("Real-time telemetry, agronomic data, and AWS S3 drone imagery inspection.")
-
-col1, col2, col3, col4 = st.columns(4)
-col1.metric("Farm Location", "Mount Carmel, IL")
-col2.metric("Avg Soil OM", f"{agro_data['soil']['OM %'].mean():.1f}%" if not agro_data['soil'].empty else "N/A")
-col3.metric("Last Crop (2024)", agro_data['crops']['Crop'].iloc[0] if not agro_data['crops'].empty else "N/A")
-col4.metric("Weed Detections (S3)", f"{len(df_spatial)}")
+if db_error:
+    st.sidebar.warning("Database not reachable — agronomic tabs are limited. "
+                       "The Drone Crop Health tab reads S3 directly and still works.")
+elif not farm:
+    st.sidebar.info("No active farm in the database yet — the agronomic tabs fill in "
+                    "once the extraction scripts have run.")
 
 st.markdown("---")
 
 # ==========================================
 # 3. TABBED DASHBOARD INTERFACE
 # ==========================================
-tab1, tab2, tab3, tab4 = st.tabs(["🗺️ Field Map & Soil", "🌤️ Spray Windows", "🖼️ Drone Diagnostics (S3)", "🛰️ Drone Crop Health"])
+# Drone Crop Health leads: it's the validated, first-party, S3-only view.
+tab_drone, tab_map, tab_spray = st.tabs(
+    ["🛰️ Drone Crop Health", "🗺️ Field Map & Soil", "🌤️ Spray Windows"])
 
-# --- TAB 1: FIELD MAP & AGRONOMICS ---
-with tab1:
-    col_map, col_data = st.columns([2, 1])
-    
-    with col_map:
-        st.subheader("Geospatial Field View")
-        # Build PyDeck Mapbox Map
-        view_state = pdk.ViewState(latitude=farm["lat"], longitude=farm["lon"], zoom=14, pitch=30)
-        
-        # Layer 1: Farm Boundary Polygon
-        boundary_layer = pdk.Layer(
-            "GeoJsonLayer",
-            data=farm["boundary"],
-            get_fill_color=[0, 255, 0, 40], # Transparent green
-            get_line_color=[0, 255, 0, 255],
-            line_width_min_pixels=3,
-        )
-        
-        # Layer 2: only plot detections that carry REAL coordinates. The
-        # third-party baseline rows don't, so this stays empty rather than
-        # showing fabricated dots. (Real drone maps live in the Drone Crop
-        # Health tab.)
-        map_layers = [boundary_layer]
-        if {"lat", "lon"}.issubset(df_spatial.columns) and not df_spatial.empty:
-            map_layers.append(pdk.Layer(
-                "ScatterplotLayer", data=df_spatial, get_position=["lon", "lat"],
-                get_fill_color=[235, 60, 60, 200], get_radius=10, pickable=True))
+# --- DRONE CROP HEALTH (first-party imagery, read from S3, no DB) ---
+with tab_drone:
+    render_drone_tab(globals().get("s3_client"), PROCESSED_S3_BUCKET_NAME, MAPBOX_TOKEN)
 
-        deck = pdk.Deck(
-            layers=map_layers,
-            initial_view_state=view_state,
-            map_style="mapbox://styles/mapbox/satellite-v9" if MAPBOX_TOKEN else "light",
-            api_keys={"mapbox": MAPBOX_TOKEN} if MAPBOX_TOKEN else None,
-            tooltip={"text": "Species: {species}\nConfidence: {confidence}\nS3 Key: {s3_key}"}
-        )
-        st.pydeck_chart(deck)
+# --- FIELD MAP & SOIL (needs the database) ---
+with tab_map:
+    if not farm:
+        st.info("Connect the PostGIS database to see the farm boundary and USDA "
+                "soil / crop history here.")
+    else:
+        col_map, col_data = st.columns([2, 1])
+        with col_map:
+            st.subheader("Geospatial Field View")
+            view_state = pdk.ViewState(latitude=farm["lat"], longitude=farm["lon"], zoom=14, pitch=30)
+            boundary_layer = pdk.Layer(
+                "GeoJsonLayer", data=farm["boundary"],
+                get_fill_color=[0, 255, 0, 40], get_line_color=[0, 255, 0, 255],
+                line_width_min_pixels=3)
+            deck = pdk.Deck(
+                layers=[boundary_layer], initial_view_state=view_state,
+                map_style="mapbox://styles/mapbox/satellite-v9" if MAPBOX_TOKEN else "light",
+                api_keys={"mapbox": MAPBOX_TOKEN} if MAPBOX_TOKEN else None)
+            st.pydeck_chart(deck)
+        with col_data:
+            st.subheader("USDA Soil Properties")
+            st.dataframe(agro_data['soil'], hide_index=True, use_container_width=True)
+            st.subheader("USDA Crop History")
+            st.dataframe(agro_data['crops'], hide_index=True, use_container_width=True)
 
-    with col_data:
-        st.subheader("USDA Soil Properties")
-        st.dataframe(agro_data['soil'], hide_index=True, use_container_width=True)
-        
-        st.subheader("USDA Crop History")
-        st.dataframe(agro_data['crops'], hide_index=True, use_container_width=True)
-
-
-# --- TAB 2: SPRAY WINDOWS (WEATHER) ---
-with tab2:
+# --- SPRAY WINDOWS (needs the database) ---
+with tab_spray:
     st.subheader("Next 12 Hours: Herbicide Application Windows")
     st.write("Cross-referencing live NWS wind and precipitation data to prevent chemical drift.")
-    
-    if not agro_data['weather'].empty:
-        for index, row in agro_data['weather'].iterrows():
+    if not agro_data or agro_data['weather'].empty:
+        st.info("Spray windows appear once the database has forecast data for the active farm.")
+    else:
+        for _, row in agro_data['weather'].iterrows():
             time_str = pd.to_datetime(row['Time']).strftime('%I:%M %p')
             wind = float(row['Wind (mph)'])
             rain = float(row['Precip %'])
-            
-            # Simple Agronomic Logic: Wind 3-10mph (prevents drift/inversion), Rain < 20%
+            # Wind 3-10mph (prevents drift/inversion), Rain < 20%
             if 3 <= wind <= 10 and rain < 20:
                 st.success(f"**{time_str}** | Temp: {row['Temp (F)']}°F | Wind: {wind} mph | Rain: {rain}% ➔ **SAFE TO SPRAY**")
             else:
                 st.error(f"**{time_str}** | Temp: {row['Temp (F)']}°F | Wind: {wind} mph | Rain: {rain}% ➔ **DO NOT SPRAY**")
-
-
-# --- TAB 3: DRONE S3 INSPECTOR ---
-with tab3:
-    col_left, col_right = st.columns([1, 1])
-
-    with col_left:
-        st.subheader("📊 Detected Weed Taxonomy")
-        st.dataframe(df_summary, hide_index=True, use_container_width=True)
-
-    with col_right:
-        st.subheader("🖼️ Live AWS S3 Asset Inspector")
-        if not df_spatial.empty:
-            selected_key = st.selectbox("Select Asset to Preview:", df_spatial["s3_key"].tolist())
-            
-            try:
-                # Generate temporary 1-hour secure URL for browser display
-                presigned_url = s3_client.generate_presigned_url(
-                    'get_object',
-                    Params={'Bucket': S3_BUCKET_NAME, 'Key': selected_key},
-                    ExpiresIn=3600
-                )
-                st.image(presigned_url, caption=f"Pulled from AWS S3: {selected_key}", use_container_width=True)
-            except Exception as e:
-                st.error("Could not fetch image. Ensure your S3 bucket name and AWS credentials are correct in the .env file.")
-
-
-# --- TAB 4: DRONE CROP HEALTH (first-party imagery, read from S3) ---
-with tab4:
-    render_drone_tab(globals().get("s3_client"), PROCESSED_S3_BUCKET_NAME, MAPBOX_TOKEN)
