@@ -10,6 +10,10 @@ overlays / problem zones, it falls back to the VARI-only view.
 import base64
 import io
 import json
+import os
+import signal
+import subprocess
+from pathlib import Path
 
 import streamlit as st
 import folium
@@ -26,6 +30,85 @@ _INDEX_HELP = {
     "exg": "Excess Green — vegetation vs. soil segmentation.",
     "tgi": "Triangular Greenness Index — chlorophyll proxy.",
 }
+
+
+# ---- local auto-export pipeline control (only when this machine hosts it) ----
+_PIPELINE_DIR = Path(os.getenv("PIPELINE_DIR",
+                               str(Path.home() / "Desktop" / "AD4-Drone-Pipeline")))
+_PIDFILE = _PIPELINE_DIR / ".pipeline.pid"
+
+
+def _pipeline_pid():
+    """PID from the pidfile if that process is alive AND is the pipeline;
+    otherwise clear the stale pidfile and return None."""
+    try:
+        pid = int(_PIDFILE.read_text().strip())
+    except (FileNotFoundError, ValueError):
+        return None
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        _PIDFILE.unlink(missing_ok=True)  # stale: process is gone
+        return None
+    except PermissionError:
+        pass  # alive but owned by someone else; fall through to the command check
+    try:  # guard against PID reuse by an unrelated process
+        cmd = subprocess.run(["ps", "-p", str(pid), "-o", "command="],
+                             capture_output=True, text=True, timeout=5).stdout
+        if "ad4_pipeline.py" not in cmd:
+            _PIDFILE.unlink(missing_ok=True)
+            return None
+    except Exception:  # noqa: BLE001 - ps hiccup must not break the status view
+        pass
+    return pid
+
+
+def _start_pipeline():
+    py = _PIPELINE_DIR / ".venv" / "bin" / "python"
+    if not py.exists():
+        py = Path("python3")
+    # Detached (own session): closing/rerunning the dashboard must not stop it.
+    p = subprocess.Popen([str(py), "ad4_pipeline.py"], cwd=str(_PIPELINE_DIR),
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         stdin=subprocess.DEVNULL, start_new_session=True)
+    _PIDFILE.write_text(str(p.pid))
+    return p.pid
+
+
+def _stop_pipeline():
+    pid = _pipeline_pid()
+    if pid is not None:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+    _PIDFILE.unlink(missing_ok=True)
+
+
+def _render_pipeline_control():
+    if not (_PIPELINE_DIR / "ad4_pipeline.py").exists():
+        return  # dashboard isn't running on the machine that hosts the pipeline
+    pid = _pipeline_pid()
+    running = pid is not None
+    c_status, c_btn = st.columns([4, 1])
+    with c_status:
+        if running:
+            st.markdown(f"🟢 **Auto-export pipeline: Running** &nbsp;·&nbsp; PID {pid}")
+        else:
+            st.markdown("⚪ **Auto-export pipeline: Stopped**")
+    with c_btn:
+        if running:
+            if st.button("Stop", key="ad4_pipeline_stop", width="stretch"):
+                _stop_pipeline()
+                st.rerun()
+        else:
+            if st.button("Start", key="ad4_pipeline_start", type="primary",
+                         width="stretch"):
+                _start_pipeline()
+                st.rerun()
+    st.caption("Runs in the background until you toggle it off or the machine "
+               "reboots. Does not auto-start on reboot.")
+    st.markdown("---")
 
 
 @st.cache_data(ttl=300, show_spinner=False)
@@ -149,7 +232,7 @@ def _render_map(s3_client, bucket, flight, assets, mapinfo, stats,
     # with a per-view component key, stops st_folium from retaining a stale
     # pan/zoom across reruns (which otherwise leaves the field just off-screen).
     m.fit_bounds(bounds, padding=(30, 30))
-    st_folium(m, height=520, use_container_width=True, returned_objects=[],
+    st_folium(m, height=520, width="stretch", returned_objects=[],
               key=f"map_{flight}_{index_key}_{int(show_problem)}")
 
     if index_key == "dsm":
@@ -166,6 +249,7 @@ def _render_map(s3_client, bucket, flight, assets, mapinfo, stats,
 
 
 def render(s3_client, processed_bucket, mapbox_token=""):
+    _render_pipeline_control()
     if s3_client is None:
         st.error("No AWS S3 client. Check your AWS credentials in the .env file.")
         return
